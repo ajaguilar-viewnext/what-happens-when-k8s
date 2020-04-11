@@ -3,12 +3,12 @@
 Imagine I want to deploy nginx to a Kubernetes cluster. I'd probably type something like this in my terminal:
 
 ```bash
-kubectl run --image=nginx --replicas=3
+kubectl run nginx --image=nginx --replicas=3
 ```
 
 and hit enter. After a few seconds, I should see three nginx pods spread across all my worker nodes. It works like magic, and that's great! But what's really going on under the hood?
 
-One of the awesome things about Kubernetes is that it handles the deployment of workloads across infrastructure through user-friendly APIs. Complexity is hidden by simple abstraction. But in order to fully understand the value it offers us, it's also useful to understand its internals. This guide will lead you through the full lifecycle of a request from the client to the kubelet, linking off to the source code where necessary to illustrate what's going on.
+One of the awesome things about Kubernetes is that it handles the deployment of workloads across infrastructure through user-friendly APIs. Complexity is hidden by simple abstractions. But in order to fully understand the value it offers us, it's also useful to understand its internals. This guide will lead you through the full lifecycle of a request from the client to the kubelet, linking off to the source code where necessary to illustrate what's going on.
 
 This is a living document. If you spot areas that can be improved or rewritten, contributions are welcome!
 
@@ -17,7 +17,7 @@ This is a living document. If you spot areas that can be improved or rewritten, 
 1. [kubectl](#kubectl)
    - [validation and generators](#validation-and-generators)
    - [API groups and version negotiation](#api-groups-and-version-negotiation)
-   - [client-side auth](#client-side-auth)
+   - [client-side auth](#client-auth)
 1. [kube-apiserver](#kube-apiserver)
    - [authentication](#authentication)
    - [authorization](#authorization)
@@ -43,25 +43,25 @@ This is a living document. If you spot areas that can be improved or rewritten, 
 
 Okay, so let's begin. We've just hit enter in our terminal. What now?
 
-The first thing that kubectl will do is perform some client-side validation. This ensures that requests that will _always_ fail (e.g. creating a non-supported resource or using a [malformed image name](https://github.com/kubernetes/kubernetes/blob/master/pkg/kubectl/cmd/run.go#L163)) will fail fast and not be sent to kube-apiserver. This improves system performance by reducing unnecessary load.
+The first thing that kubectl will do is perform some client-side validation. This ensures that requests that will _always_ fail (e.g. creating a non-supported resource or using a [malformed image name](https://github.com/kubernetes/kubernetes/blob/v1.14.0/pkg/kubectl/cmd/run/run.go#L264)) will fail fast and not be sent to kube-apiserver. This improves system performance by reducing unnecessary load.
 
 After validation, kubectl begins assembling the HTTP request it will send to kube-apiserver. All attempts to access or change state in the Kubernetes system goes through the API server, which in turns communicates with etcd. The kubectl client is no different. To construct the HTTP request, kubectl uses something called [generators](https://kubernetes.io/docs/user-guide/kubectl-conventions/#generators) which is an abstraction that takes care of serialization.
 
-What may not be obvious is that you can actually specify multiple resource types with `kubectl run`, not just Deployments. To make that work, kubectl will [infer](https://github.com/kubernetes/kubernetes/blob/master/pkg/kubectl/cmd/run.go#L231-L257) the resource type if the generator name wasn't explicitly specified using the `--generator` flag. 
+What may not be obvious is that you can actually specify multiple resource types with `kubectl run`, not just Deployments. To make that work, kubectl will [infer](https://github.com/kubernetes/kubernetes/blob/v1.14.0/pkg/kubectl/cmd/run/run.go#L319-L339) the resource type if the generator name wasn't explicitly specified using the `--generator` flag.
 
-For example, resources that have `--restart-policy=Always` are considered Deployments, and those with `--restart-policy=Never` are considered Pods. kubectl will also figure out whether other actions need to be triggered, such as recording the command (for rollouts or auditing), or whether this command is just a dry run (indicated by the `--dry-run` flag). 
+For example, resources that have `--restart-policy=Always` are considered Deployments, and those with `--restart-policy=Never` are considered Pods. kubectl will also figure out whether other actions need to be triggered, such as recording the command (for rollouts or auditing), or whether this command is just a dry run (indicated by the `--dry-run` flag).
 
-After realising that we want to create a Deployment, it will use the `DeploymentV1Beta1` generator to generate a [runtime object](https://github.com/kubernetes/kubernetes/blob/7650665059e65b4b22375d1e28da5306536a12fb/pkg/kubectl/run.go#L59) from our provided parameters. A "runtime object" is a generic term for a resource. 
+After realising that we want to create a Deployment, it will use the `DeploymentAppsV1` generator to generate a [runtime object](https://github.com/kubernetes/kubernetes/blob/v1.14.0/pkg/kubectl/generate/versioned/run.go#L237) from our provided parameters. A "runtime object" is a generic term for a resource.
 
 ### API groups and version negotiation
 
-What's worth pointing out before we continue is that Kubernetes uses a _versioned_ API that is categorised into "API groups". An API group is meant to categorise similar resources so that they're easier to reason about. It also provides a better alternative to a singular monolithic API. The API group of a Deployment is named `apps`, and its most recent version is `v1beta2`. This is why you need type `apiVersion: apps/v1beta2` at the top of your Deployment manifests.
+What's worth pointing out before we continue is that Kubernetes uses a _versioned_ API that is categorised into "API groups". An API group is meant to categorise similar resources so that they're easier to reason about. It also provides a better alternative to a singular monolithic API. The API group of a Deployment is named `apps`, and its most recent version is `v1`. This is why you need type `apiVersion: apps/v1` at the top of your Deployment manifests.
 
-Anywho... After kubectl generates the runtime object, it starts to [find the appropriate API group and version](https://github.com/kubernetes/kubernetes/blob/master/pkg/kubectl/cmd/run.go#L580-L597) for it and then [assembles a versioned client](https://github.com/kubernetes/kubernetes/blob/master/pkg/kubectl/cmd/run.go#L598) that is aware of the various REST semantics for the resource. This discovery stage is called version negotiation and involves kubectl scanning the `/apis` path on the remote API to retrieve all possible API groups. Since kube-apiserver exposes its schema document (in OpenAPI format) at this path, it's easy for clients to perform their own discovery. 
+Anyhow... After kubectl generates the runtime object, it starts to [find the appropriate API group and version](https://github.com/kubernetes/kubernetes/blob/v1.14.0/pkg/kubectl/cmd/run/run.go#L674-L686) for it and then [assembles a versioned client](https://github.com/kubernetes/kubernetes/blob/v1.14.0/pkg/kubectl/cmd/run/run.go#L705-L708) that is aware of the various REST semantics for the resource. This discovery stage is called version negotiation and involves kubectl scanning the `/apis` path on the remote API to retrieve all possible API groups. Since kube-apiserver exposes its schema document (in OpenAPI format) at this path, it's easy for clients to perform their own discovery.
 
-To improve performance, kubectl also [caches the OpenAPI schema](https://github.com/kubernetes/kubernetes/blob/7650665059e65b4b22375d1e28da5306536a12fb/pkg/kubectl/cmd/util/factory_client_access.go#L117) to the `~/.kube/schema` directory. If you want to see this API discovery in action, try deleting that directory and running a command with the `-v` flag turned to the max. You'll see all the HTTP requests which are trying to find those API versions. There are lots!
+To improve performance, kubectl also [caches the OpenAPI schema](https://github.com/kubernetes/kubernetes/blob/v1.14.0/staging/src/k8s.io/cli-runtime/pkg/genericclioptions/config_flags.go#L234) to the `~/.kube/cache/discovery` directory. If you want to see this API discovery in action, try deleting that directory and running a command with the `-v` flag turned to the max. You'll see all the HTTP requests which are trying to find those API versions. There are lots!
 
-The final step is to actually [send](https://github.com/kubernetes/kubernetes/blob/master/pkg/kubectl/cmd/run.go#L628) the HTTP request. Once it does so and gets back a successful response, kubectl will then print out a success message [based on the desired output format](https://github.com/kubernetes/kubernetes/blob/master/pkg/kubectl/cmd/run.go#L403-L407).
+The final step is to actually [send](https://github.com/kubernetes/kubernetes/blob/v1.14.0/pkg/kubectl/cmd/run/run.go#L709) the HTTP request. Once it does so and gets back a successful response, kubectl will then print out a success message [based on the desired output format](https://github.com/kubernetes/kubernetes/blob/v1.14.0/pkg/kubectl/cmd/run/run.go#L459).
 
 ### Client auth
 
@@ -73,7 +73,7 @@ In order to send the request successfully, kubectl needs to be able to authentic
 - if the `$KUBECONFIG` environment variable is defined, use that.
 - otherwise look in a [predictable home directory](https://github.com/kubernetes/client-go/blob/master/tools/clientcmd/loader.go#L52) like `~/.kube`, and use the first file found.
 
-After parsing the file, it then determines the current context to use, the current cluster to point to, and any auth information associated with the current user. If the user provided flag-specific values (such as `--username`) these take precedence and will override those specified in kubeconfig. Once it has this information, kubectl populates the client's configuration so that it is able decorate the HTTP request appropriately:
+After parsing the file, it then determines the current context to use, the current cluster to point to, and any auth information associated with the current user. If the user provided flag-specific values (such as `--username`) these take precedence and will override those specified in kubeconfig. Once it has this information, kubectl populates the client's configuration so that it is able to decorate the HTTP request appropriately:
 
 - x509 certificates are sent using [`tls.TLSConfig`](https://github.com/kubernetes/client-go/blob/82aa063804cf055e16e8911250f888bc216e8b61/rest/transport.go#L80-L89) (this also includes the root CA)
 - bearer tokens are [sent](https://github.com/kubernetes/client-go/blob/c6f8cf2c47d21d55fa0df928291b2580544886c8/transport/round_trippers.go#L314) in the "Authorization" HTTP header
@@ -140,7 +140,7 @@ How does kube-apiserver know what to do when it accepts our request? Well, there
 
 By this point, kube-apiserver is fully aware of what routes exist and has an internal mapping of which handlers and storage providers to invoke if a request matches. What a smart cookie. Now let's imagine our HTTP request has flown in:
 
-1. If the handler chain can match the request to a set pattern (i.e. to the routes we registered), it will [dispatch the dedicated handler](https://github.com/kubernetes/apiserver/blob/7001bc4df8883d4a0ec84cd4b2117655a0009b6c/pkg/server/handler.go#L143) that was registered for the route. Otherwise it fall back to a [path-based handler](https://github.com/kubernetes/apiserver/blob/7001bc4df8883d4a0ec84cd4b2117655a0009b6c/pkg/server/mux/pathrecorder.go#L248) (this is what happens when you call `/apis`). If no handlers are registered for that path, a [not found handler](https://github.com/kubernetes/apiserver/blob/7001bc4df8883d4a0ec84cd4b2117655a0009b6c/pkg/server/mux/pathrecorder.go#L254) is invoked which results in a 404.
+1. If the handler chain can match the request to a set pattern (i.e. to the routes we registered), it will [dispatch the dedicated handler](https://github.com/kubernetes/apiserver/blob/7001bc4df8883d4a0ec84cd4b2117655a0009b6c/pkg/server/handler.go#L143) that was registered for the route. Otherwise it falls back to a [path-based handler](https://github.com/kubernetes/apiserver/blob/7001bc4df8883d4a0ec84cd4b2117655a0009b6c/pkg/server/mux/pathrecorder.go#L248) (this is what happens when you call `/apis`). If no handlers are registered for that path, a [not found handler](https://github.com/kubernetes/apiserver/blob/7001bc4df8883d4a0ec84cd4b2117655a0009b6c/pkg/server/mux/pathrecorder.go#L254) is invoked which results in a 404.
 1. Luckily for us, we have a registered route called [`createHandler`](https://github.com/kubernetes/apiserver/blob/7001bc4df8883d4a0ec84cd4b2117655a0009b6c/pkg/endpoints/handlers/create.go#L37)! What does it do? Well it will first decode the HTTP request and perform basic validation, such as ensuring the JSON they provided correlates with our expectation of the versioned API resource.
 1. Auditing and final admission [will occur](https://github.com/kubernetes/apiserver/blob/7001bc4df8883d4a0ec84cd4b2117655a0009b6c/pkg/endpoints/handlers/create.go#L93-L104). 
 1. The resource will be [saved to etcd](https://github.com/kubernetes/apiserver/blob/7001bc4df8883d4a0ec84cd4b2117655a0009b6c/pkg/endpoints/handlers/create.go#L111) by [delegating to the storage provider](https://github.com/kubernetes/apiserver/blob/19667a1afc13cc13930c40a20f2c12bbdcaaa246/pkg/registry/generic/registry/store.go#L327). Usually the etcd key will be the form of `<namespace>/<name>`, but this is configurable.
@@ -194,7 +194,7 @@ After a Deployment record is stored to etcd and initialized, it is made visible 
 
 This handler will be executed when our Deployment first becomes available and will start by [adding the object to an internal work queue](https://github.com/kubernetes/kubernetes/blob/master/pkg/controller/deployment/deployment_controller.go#L170). By the time it gets around to processing our object, the controller will [inspect our Deployment](https://github.com/kubernetes/kubernetes/blob/master/pkg/controller/deployment/deployment_controller.go#L572) and [realise](https://github.com/kubernetes/kubernetes/blob/master/pkg/controller/deployment/deployment_controller.go#L633) that there are no ReplicaSet or Pod records associated with it. It does this by querying kube-apiserver with label selectors. What's interesting to note is that this sychronization process is state agnostic: it reconciles new records in the same way as existing ones.
 
-After realising none exist, it will begin a [scaling process](https://github.com/kubernetes/kubernetes/blob/master/pkg/controller/deployment/sync.go#L385) to start resolving state. It does this by rolling out (e.g. creating) a ReplicaSet resource, assigning it a label selector, and giving it the revision number of 1. The ReplicaSet's PodSpec is copied from the Deployment's manifest, as well as other relevant metadata. Sometimes the Deployment record will need to be updated after this as well (for instance if the progress deadline is set). 
+After realising none exist, it will begin a [scaling process](https://github.com/kubernetes/kubernetes/blob/master/pkg/controller/deployment/sync.go#L385) to start resolving state. It does this by rolling out (i.e. creating) a ReplicaSet resource, assigning it a label selector, and giving it the revision number of 1. The ReplicaSet's PodSpec is copied from the Deployment's manifest, as well as other relevant metadata. Sometimes the Deployment record will need to be updated after this as well (for instance if the progress deadline is set). 
 
 The [status is then updated](https://github.com/kubernetes/kubernetes/blob/master/pkg/controller/deployment/sync.go#L70) and it then re-enters the same reconciliation loop waiting for the deployment to match a desired, completed state. Since the Deployment controller is only concerned about creating ReplicaSets, this reconcilation stage needs to be continued by the next controller, the ReplicaSet controller. 
 
@@ -231,7 +231,7 @@ After all the controllers have run, we have a Deployment, a ReplicaSet and three
 
 The scheduler runs as a standalone component of the control plane and operates in the same way as other controllers: it listens out for events and attempts to reconcile state. In this case, it [filters pods](https://github.com/kubernetes/kubernetes/blob/master/plugin/pkg/scheduler/factory/factory.go#L190) that have an empty `NodeName` field in their PodSpec and attempts to find a suitable Node that the pod can reside on. 
 
-In order to find a suitable pod, a specific scheduling algorithm is used. The way the default scheduling algorithm works is the following:
+In order to find a suitable node, a specific scheduling algorithm is used. The way the default scheduling algorithm works is the following:
 
 1. When the scheduler starts, a [chain of default predicates are registered](https://github.com/kubernetes/kubernetes/blob/2d64ce5e8e45e26b02492d2b6c85e5ebfb1e4761/plugin/pkg/scheduler/algorithmprovider/defaults/defaults.go#L65-L81). These predicates are effectively functions that, when evaluated, [filter Nodes](https://github.com/kubernetes/kubernetes/blob/2d64ce5e8e45e26b02492d2b6c85e5ebfb1e4761/plugin/pkg/scheduler/core/generic_scheduler.go#L117) based on their suitability to host a pod. For example, if the PodSpec explicitly requests CPU or RAM resources, and a Node cannot meet these requests due to lack of capacity, it will be deselected for the Pod (resource capacity is calculated as the _total capacity_ minus the _sum of the resource requests_ of currently running containers).
 
@@ -253,7 +253,7 @@ Okay, the main controller loop has finished, phew! Let's summarise: the HTTP req
 
 The kubelet is an agent that runs on every node in a Kubernetes cluster and is responsible for, among other things, managing the lifecycle of Pods. This means it handles all of the translation logic between the abstraction of a "Pod" (which is really just a Kubernetes concept) and its building blocks, containers. It also handles all of the associated logic around mounting volumes, container logging, garbage collection, and many more important things.
 
-A useful way of thinking about the kubelet is again like a controller! It queries Pods from kube-apiserver every 20 seconds (this is configurable), filtering the ones whose `NodeName` matches the name of the node the kubelet is running on. Once it has that list, it detects new additions by comparing against its own internal cache and begins to synchronise state if any discrepencies exist. Let's take a look at what that synchronization process looks like:
+A useful way of thinking about the kubelet is again like a controller! It queries Pods from kube-apiserver every 20 seconds (this is configurable), filtering the ones whose `NodeName` [matches the name](https://github.com/kubernetes/kubernetes/blob/3b66adb8bc6929e1205bcb2bc32f380c39be8381/pkg/kubelet/config/apiserver.go#L34) of the node the kubelet is running on. Once it has that list, it detects new additions by comparing against its own internal cache and begins to synchronise state if any discrepencies exist. Let's take a look at what that synchronization process looks like:
 
 1. If the pod is being created (ours is!), it [registers some startup metrics](https://github.com/kubernetes/kubernetes/blob/fc8bfe2d8929e11a898c4557f9323c482b5e8842/pkg/kubelet/kubelet.go#L1519) that is used in Prometheus for tracking pod latency.
 1. It then [generates a PodStatus](https://github.com/kubernetes/kubernetes/blob/dd9981d038012c120525c9e6df98b3beb3ef19e1/pkg/kubelet/kubelet_pods.go#L1287) object, which represents the state of a Pod's current Phase. The Phase of a Pod is a high-level summary of where the Pod is in its lifecycle. Examples include `Pending`, `Running`, `Succeeded`, `Failed` and `Unknown`. Generating this state is quite complicated, so let's dive into exactly what happens:
@@ -326,7 +326,7 @@ This is usually accomplished using a concept called overlay networking, which is
 
 All the networking shenanigans are done and out of the way. What's left? Well we need to actually start out workload containers. 
 
-Once the sandbox has finished initializing and is active, the kubelet can begin creating containers for it. It first [starts any init containers](https://github.com/kubernetes/kubernetes/blob/5adfb24f8f25a0d57eb9a7b158db46f9f46f0d80/pkg/kubelet/kuberuntime/kuberuntime_manager.go#L690) as defined in the PodSpec, and will then start the main containers themselves. The process for doing is this: 
+Once the sandbox has finished initializing and is active, the kubelet can begin creating containers for it. It first [starts any init containers](https://github.com/kubernetes/kubernetes/blob/5adfb24f8f25a0d57eb9a7b158db46f9f46f0d80/pkg/kubelet/kuberuntime/kuberuntime_manager.go#L690) as defined in the PodSpec, and will then start the main containers themselves. The process for doing this is: 
 
 1. [Pull the image](https://github.com/kubernetes/kubernetes/blob/5f9f4a1c5939436fa320e9bc5973a55d6446e59f/pkg/kubelet/kuberuntime/kuberuntime_container.go#L90) for the container. Any secrets that are defined in the PodSpec are used for private registries.
 1. [Create the container](https://github.com/kubernetes/kubernetes/blob/5f9f4a1c5939436fa320e9bc5973a55d6446e59f/pkg/kubelet/kuberuntime/kuberuntime_container.go#L115) via CRI. It does this by populating a `ContainerConfig` struct (in which the command, image, labels, mounts, devices, environment variables etc. are defined) from the parent PodSpec and then sending that via protobufs to the CRI plugin. For Docker, it deserializes the payload and populates its own config structures to send to the Daemon API. In the process it applies a few metadata labels (such container type, log path, sandbox ID) to the container.
